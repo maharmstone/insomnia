@@ -12,6 +12,9 @@
 //  9. Assigning a might_sleep/sleeps function to a nosleep function pointer is
 //     an error.
 // 10. Builtins/intrinsics are implicitly nosleep.
+// 11. nosleep lexical blocks inside functions: calls within the block are
+//     checked as if the function were nosleep. Nested blocks are allowed.
+// 12. Jumping into a nosleep block from outside one is an error.
 
 #include "clang/AST/AST.h"
 #include "clang/AST/ASTConsumer.h"
@@ -67,6 +70,7 @@ struct NoSleepAttrInfo : public ParsedAttrInfo {
   NoSleepAttrInfo() {
     OptArgs = 0;
     NumArgs = 0;
+    IsStmt = 1;
     Spellings = S;
   }
   bool diagAppertainsToDecl(Sema &S, const ParsedAttr &Attr,
@@ -83,6 +87,13 @@ struct NoSleepAttrInfo : public ParsedAttrInfo {
   AttrHandling handleDeclAttribute(Sema &S, Decl *D,
                                    const ParsedAttr &Attr) const override {
     return applySleepAnnotation(S, D, Attr, "nosleep");
+  }
+  AttrHandling handleStmtAttribute(Sema &S, Stmt *St,
+                                   const ParsedAttr &Attr,
+                                   class Attr *&Result) const override {
+    Result = AnnotateAttr::Create(S.Context, "nosleep", nullptr, 0,
+                                  Attr.getRange());
+    return AttributeApplied;
   }
 };
 
@@ -243,6 +254,9 @@ class SleepCheckConsumer : public ASTConsumer {
   unsigned DiagSuggestNoSleep;
   unsigned DiagNoSleepCallsBad;
   unsigned DiagFPtrAssign;
+  unsigned DiagNoSleepBlockCall;
+  unsigned DiagNoSleepBlockFPtr;
+  unsigned DiagGotoIntoNoSleep;
 
   std::map<const FunctionDecl *, FuncInfo> Funcs;
 
@@ -262,6 +276,15 @@ public:
     DiagFPtrAssign = DE.getCustomDiagID(
         DiagnosticsEngine::Error,
         "assigning '%0' function '%1' to 'nosleep' function pointer");
+    DiagNoSleepBlockCall = DE.getCustomDiagID(
+        DiagnosticsEngine::Error,
+        "call to '%0' function '%1' inside 'nosleep' block");
+    DiagNoSleepBlockFPtr = DE.getCustomDiagID(
+        DiagnosticsEngine::Error,
+        "call through '%0' function pointer inside 'nosleep' block");
+    DiagGotoIntoNoSleep = DE.getCustomDiagID(
+        DiagnosticsEngine::Error,
+        "goto jumps into 'nosleep' block from outside a 'nosleep' context");
   }
 
   void HandleTranslationUnit(ASTContext &Ctx) override;
@@ -272,6 +295,12 @@ private:
                         DiagnosticsEngine &DE);
   void checkVarInit(const VarDecl *VD, DiagnosticsEngine &DE);
   SleepStatus resolveCallee(const FunctionDecl *Callee);
+  void checkNoSleepBlocks(const FunctionDecl *FD, ASTContext &Ctx,
+                          DiagnosticsEngine &DE);
+  void walkNoSleepBlocks(const Stmt *S, unsigned Depth, ASTContext &Ctx,
+                         DiagnosticsEngine &DE,
+                         std::map<const LabelDecl *, unsigned> &LabelDepths,
+                         std::vector<std::pair<const GotoStmt *, unsigned>> &Gotos);
 };
 
 // ---------------------------------------------------------------------------
@@ -404,6 +433,115 @@ void SleepCheckConsumer::checkVarInit(const VarDecl *VD,
         DE.Report(VD->getLocation(), DiagFPtrAssign)
             << sleepStatusStr(rhsStatus) << FD->getNameAsString();
       }
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Helper: check if an AttributedStmt has a nosleep annotation
+// ---------------------------------------------------------------------------
+static bool isNoSleepBlock(const AttributedStmt *AS) {
+  for (const auto *A : AS->getAttrs()) {
+    if (const auto *Ann = dyn_cast<AnnotateAttr>(A)) {
+      if (Ann->getAnnotation() == "nosleep")
+        return true;
+    }
+  }
+  return false;
+}
+
+// ---------------------------------------------------------------------------
+// Walk function body checking calls inside nosleep blocks (rules 11, 12)
+// ---------------------------------------------------------------------------
+void SleepCheckConsumer::walkNoSleepBlocks(
+    const Stmt *S, unsigned Depth, ASTContext &Ctx, DiagnosticsEngine &DE,
+    std::map<const LabelDecl *, unsigned> &LabelDepths,
+    std::vector<std::pair<const GotoStmt *, unsigned>> &Gotos) {
+  if (!S)
+    return;
+
+  // Track nosleep block boundaries
+  if (const auto *AS = dyn_cast<AttributedStmt>(S)) {
+    if (isNoSleepBlock(AS)) {
+      walkNoSleepBlocks(AS->getSubStmt(), Depth + 1, Ctx, DE,
+                        LabelDepths, Gotos);
+      return;
+    }
+  }
+
+  // Record label depths for goto checking
+  if (const auto *LS = dyn_cast<LabelStmt>(S)) {
+    LabelDepths[LS->getDecl()] = Depth;
+    // Continue walking the sub-statement of the label
+    walkNoSleepBlocks(LS->getSubStmt(), Depth, Ctx, DE, LabelDepths, Gotos);
+    return;
+  }
+
+  // Record gotos for later cross-checking
+  if (const auto *GS = dyn_cast<GotoStmt>(S)) {
+    Gotos.push_back({GS, Depth});
+  }
+
+  // Check calls inside nosleep blocks (Depth > 0 means we're in one)
+  if (Depth > 0) {
+    if (const auto *CE = dyn_cast<CallExpr>(S)) {
+      if (const FunctionDecl *Callee = CE->getDirectCallee()) {
+        SleepStatus cs = resolveCallee(Callee->getCanonicalDecl());
+        if (cs == SleepStatus::MightSleep || cs == SleepStatus::Sleeps) {
+          DE.Report(CE->getBeginLoc(), DiagNoSleepBlockCall)
+              << sleepStatusStr(cs) << Callee->getNameAsString();
+        }
+      } else {
+        // Indirect call through function pointer
+        const Expr *CalleeExpr = CE->getCallee()->IgnoreParenImpCasts();
+        SleepStatus fpStatus = SleepStatus::Unknown;
+
+        if (const auto *DRE = dyn_cast<DeclRefExpr>(CalleeExpr)) {
+          if (const auto *VD = dyn_cast<VarDecl>(DRE->getDecl()))
+            fpStatus = getVarAnnotation(VD);
+        } else if (const auto *ME = dyn_cast<MemberExpr>(CalleeExpr)) {
+          if (const auto *FD = dyn_cast<FieldDecl>(ME->getMemberDecl()))
+            fpStatus = getFieldAnnotation(FD);
+        }
+
+        if (fpStatus != SleepStatus::NoSleep) {
+          const char *status = (fpStatus == SleepStatus::Unknown)
+                                   ? "might_sleep"
+                                   : sleepStatusStr(fpStatus);
+          DE.Report(CE->getBeginLoc(), DiagNoSleepBlockFPtr) << status;
+        }
+      }
+    }
+  }
+
+  for (const Stmt *Child : S->children())
+    walkNoSleepBlocks(Child, Depth, Ctx, DE, LabelDepths, Gotos);
+}
+
+void SleepCheckConsumer::checkNoSleepBlocks(const FunctionDecl *FD,
+                                            ASTContext &Ctx,
+                                            DiagnosticsEngine &DE) {
+  // For functions already tagged nosleep at function level, rule 7 handles
+  // everything and nosleep blocks are redundant — skip block-level checking.
+  const FunctionDecl *Canon = FD->getCanonicalDecl();
+  auto it = Funcs.find(Canon);
+  if (it != Funcs.end() && it->second.ExplicitTag == SleepStatus::NoSleep)
+    return;
+
+  std::map<const LabelDecl *, unsigned> LabelDepths;
+  std::vector<std::pair<const GotoStmt *, unsigned>> Gotos;
+
+  walkNoSleepBlocks(FD->getBody(), 0, Ctx, DE, LabelDepths, Gotos);
+
+  // Rule 12: check gotos — error if jumping into nosleep from outside
+  for (auto &[GS, GotoDepth] : Gotos) {
+    const LabelDecl *Target = GS->getLabel();
+    auto lit = LabelDepths.find(Target);
+    if (lit == LabelDepths.end())
+      continue; // label not found (shouldn't happen in valid code)
+    unsigned LabelDep = lit->second;
+    if (LabelDep > 0 && GotoDepth == 0) {
+      DE.Report(GS->getGotoLoc(), DiagGotoIntoNoSleep);
     }
   }
 }
@@ -557,10 +695,13 @@ void SleepCheckConsumer::HandleTranslationUnit(ASTContext &Ctx) {
   }
 
   // Rule 9: function-pointer assignments
+  // Rules 11, 12: nosleep blocks and goto checking
   for (auto *D : Ctx.getTranslationUnitDecl()->decls()) {
     if (auto *FD = dyn_cast<FunctionDecl>(D)) {
-      if (FD->doesThisDeclarationHaveABody())
+      if (FD->doesThisDeclarationHaveABody()) {
         checkFPtrAssigns(FD->getBody(), Ctx, DE);
+        checkNoSleepBlocks(FD, Ctx, DE);
+      }
     }
     if (auto *VD = dyn_cast<VarDecl>(D))
       checkVarInit(VD, DE);
