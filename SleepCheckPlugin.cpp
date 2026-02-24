@@ -926,9 +926,12 @@ void SleepCheckConsumer::HandleTranslationUnit(ASTContext &Ctx) {
     if (!FI.HasBody || !FI.Def)
       continue;
 
-    // Rule 6: untagged definition that turned out nosleep
+    // Rule 6: untagged definition that turned out nosleep — only warn when
+    // there is a separate forward declaration (e.g. from a header), since
+    // that's what exposes the function to other TUs without annotation.
     if (FI.ExplicitTag == SleepStatus::Unknown &&
-        FI.Computed == SleepStatus::NoSleep) {
+        FI.Computed == SleepStatus::NoSleep &&
+        Canon != FI.Def) {
       DE.Report(FI.Def->getLocation(), DiagSuggestNoSleep)
           << FI.Def->getNameAsString();
     }

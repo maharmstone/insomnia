@@ -16,6 +16,7 @@ __attribute__((nosleep)) void call_generic(generic_fp fp) {
 // Rule 9: assigning sleeps function to nosleep function pointer
 typedef void (*safe_fp)(void) __attribute__((nosleep));
 
+void test_fptr_assign(void);
 // EXPECTED-WARNING: function 'test_fptr_assign' makes no sleeping calls
 void test_fptr_assign(void) {
     // EXPECTED-ERROR: assigning 'sleeps' function 'sleepy' to 'nosleep' function pointer

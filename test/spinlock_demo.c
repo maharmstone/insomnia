@@ -7,11 +7,11 @@
 
 typedef struct { int locked; } spinlock_t;
 
-__attribute__((nosleep_enter)) __attribute__((nosleep)) void spin_lock(spinlock_t *lock) {
+__attribute__((nosleep_enter)) void spin_lock(spinlock_t *lock) {
     lock->locked = 1;
 }
 
-__attribute__((nosleep_exit)) __attribute__((nosleep)) void spin_unlock(spinlock_t *lock) {
+__attribute__((nosleep_exit)) void spin_unlock(spinlock_t *lock) {
     lock->locked = 0;
 }
 

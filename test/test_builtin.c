@@ -1,5 +1,6 @@
 // Test rule 10: builtins/intrinsics are implicitly nosleep
 
+void uses_builtin(void);
 // EXPECTED-WARNING: function 'uses_builtin' makes no sleeping calls
 void uses_builtin(void) {
     // __builtin_expect is a builtin — should be nosleep
