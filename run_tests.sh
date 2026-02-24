@@ -67,7 +67,8 @@ run_test() {
 echo "=== Sleep-Check Plugin Tests ==="
 echo ""
 
-for test_file in "$TEST_DIR"/test_*.c; do
+for test_file in "$TEST_DIR"/test_*.c "$TEST_DIR"/test_*.cpp; do
+    [ -f "$test_file" ] || continue
     run_test "$test_file"
 done
 

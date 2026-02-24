@@ -23,7 +23,7 @@ __attribute__((might_sleep)) void maybe_func(void) {
     // might block
 }
 
-void process_data(spinlock_t *lock) {
+__attribute__((might_sleep)) void process_data(spinlock_t *lock) {
     spin_lock(lock);
 
     do_nosleep_work();

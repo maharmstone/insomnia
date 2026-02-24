@@ -582,8 +582,9 @@ void SleepCheckConsumer::analyzeNoSleepCFG(
     const FunctionDecl *FD, ASTContext &Ctx, DiagnosticsEngine &DE,
     const std::set<const Stmt *> &NoSleepStmts) {
 
-  // Build CFG
+  // Build CFG with implicit destructors and cleanup functions
   CFG::BuildOptions BO;
+  BO.AddImplicitDtors = true;
   std::unique_ptr<CFG> cfg = CFG::buildCFG(FD, FD->getBody(), &Ctx, BO);
   if (!cfg)
     return;
@@ -610,62 +611,130 @@ void SleepCheckConsumer::analyzeNoSleepCFG(
 
     // Process each element in the block
     for (const auto &Elem : *Block) {
-      std::optional<CFGStmt> CS = Elem.getAs<CFGStmt>();
-      if (!CS)
-        continue;
 
-      const Stmt *S = CS->getStmt();
+      // --- CFGStmt: regular statements (calls, constructs, etc.) ---
+      if (std::optional<CFGStmt> CS = Elem.getAs<CFGStmt>()) {
+        const Stmt *S = CS->getStmt();
 
-      if (const auto *CE = dyn_cast<CallExpr>(S)) {
-        if (const FunctionDecl *Callee = CE->getDirectCallee()) {
-          const FunctionDecl *CanonCallee = Callee->getCanonicalDecl();
+        if (const auto *CE = dyn_cast<CallExpr>(S)) {
+          if (const FunctionDecl *Callee = CE->getDirectCallee()) {
+            const FunctionDecl *CanonCallee = Callee->getCanonicalDecl();
 
-          // Check for nosleep_enter/exit
-          if (isNoSleepEnter(CanonCallee)) {
-            Depth++;
-            continue;
+            // Check for nosleep_enter/exit
+            if (isNoSleepEnter(CanonCallee)) {
+              Depth++;
+              continue;
+            }
+            if (isNoSleepExit(CanonCallee)) {
+              if (Depth > 0)
+                Depth--;
+              continue;
+            }
+
+            // Check if calling a sleeping function in nosleep context
+            bool inNoSleep = (Depth > 0) ||
+                             (NoSleepStmts.count(S) > 0);
+            if (inNoSleep) {
+              SleepStatus cs = resolveCallee(CanonCallee);
+              if ((cs == SleepStatus::MightSleep || cs == SleepStatus::Sleeps) &&
+                  Reported.insert(S).second) {
+                DE.Report(CE->getBeginLoc(), DiagNoSleepContextCall)
+                    << sleepStatusStr(cs) << Callee->getNameAsString();
+              }
+            }
+          } else {
+            // Indirect call through function pointer
+            bool inNoSleep = (Depth > 0) ||
+                             (NoSleepStmts.count(S) > 0);
+            if (inNoSleep) {
+              const Expr *CalleeExpr = CE->getCallee()->IgnoreParenImpCasts();
+              SleepStatus fpStatus = SleepStatus::Unknown;
+
+              if (const auto *DRE = dyn_cast<DeclRefExpr>(CalleeExpr)) {
+                if (const auto *VD = dyn_cast<VarDecl>(DRE->getDecl()))
+                  fpStatus = getVarAnnotation(VD);
+              } else if (const auto *ME = dyn_cast<MemberExpr>(CalleeExpr)) {
+                if (const auto *FldD = dyn_cast<FieldDecl>(ME->getMemberDecl()))
+                  fpStatus = getFieldAnnotation(FldD);
+              }
+
+              if (fpStatus != SleepStatus::NoSleep && Reported.insert(S).second) {
+                const char *status = (fpStatus == SleepStatus::Unknown)
+                                         ? "might_sleep"
+                                         : sleepStatusStr(fpStatus);
+                DE.Report(CE->getBeginLoc(), DiagNoSleepContextFPtr) << status;
+              }
+            }
           }
-          if (isNoSleepExit(CanonCallee)) {
+        } else if (const auto *CtorExpr = dyn_cast<CXXConstructExpr>(S)) {
+          // C++ constructor call
+          const CXXConstructorDecl *Ctor = CtorExpr->getConstructor();
+
+          if (isNoSleepEnter(Ctor)) {
+            Depth++;
+          } else if (isNoSleepExit(Ctor)) {
             if (Depth > 0)
               Depth--;
-            continue;
-          }
-
-          // Check if calling a sleeping function in nosleep context
-          bool inNoSleep = (Depth > 0) ||
-                           (NoSleepStmts.count(S) > 0);
-          if (inNoSleep) {
-            SleepStatus cs = resolveCallee(CanonCallee);
-            if ((cs == SleepStatus::MightSleep || cs == SleepStatus::Sleeps) &&
-                Reported.insert(S).second) {
-              DE.Report(CE->getBeginLoc(), DiagNoSleepContextCall)
-                  << sleepStatusStr(cs) << Callee->getNameAsString();
-            }
-          }
-        } else {
-          // Indirect call through function pointer
-          bool inNoSleep = (Depth > 0) ||
-                           (NoSleepStmts.count(S) > 0);
-          if (inNoSleep) {
-            const Expr *CalleeExpr = CE->getCallee()->IgnoreParenImpCasts();
-            SleepStatus fpStatus = SleepStatus::Unknown;
-
-            if (const auto *DRE = dyn_cast<DeclRefExpr>(CalleeExpr)) {
-              if (const auto *VD = dyn_cast<VarDecl>(DRE->getDecl()))
-                fpStatus = getVarAnnotation(VD);
-            } else if (const auto *ME = dyn_cast<MemberExpr>(CalleeExpr)) {
-              if (const auto *FldD = dyn_cast<FieldDecl>(ME->getMemberDecl()))
-                fpStatus = getFieldAnnotation(FldD);
-            }
-
-            if (fpStatus != SleepStatus::NoSleep && Reported.insert(S).second) {
-              const char *status = (fpStatus == SleepStatus::Unknown)
-                                       ? "might_sleep"
-                                       : sleepStatusStr(fpStatus);
-              DE.Report(CE->getBeginLoc(), DiagNoSleepContextFPtr) << status;
+          } else {
+            // Check if calling a sleeping constructor in nosleep context
+            bool inNoSleep = (Depth > 0) ||
+                             (NoSleepStmts.count(S) > 0);
+            if (inNoSleep) {
+              SleepStatus cs = resolveCallee(Ctor);
+              if ((cs == SleepStatus::MightSleep || cs == SleepStatus::Sleeps) &&
+                  Reported.insert(S).second) {
+                DE.Report(CtorExpr->getBeginLoc(), DiagNoSleepContextCall)
+                    << sleepStatusStr(cs) << Ctor->getNameAsString();
+              }
             }
           }
         }
+        continue;
+      }
+
+      // --- CFGAutomaticObjDtor: implicit C++ destructor at scope exit ---
+      if (std::optional<CFGAutomaticObjDtor> AutoDtor =
+              Elem.getAs<CFGAutomaticObjDtor>()) {
+        const CXXDestructorDecl *Dtor =
+            AutoDtor->getDestructorDecl(Ctx);
+        if (Dtor) {
+          if (isNoSleepExit(Dtor)) {
+            if (Depth > 0)
+              Depth--;
+          } else if (isNoSleepEnter(Dtor)) {
+            Depth++;
+          } else if (Depth > 0) {
+            // Check if destructor might sleep in nosleep context
+            SleepStatus cs = resolveCallee(Dtor);
+            if (cs == SleepStatus::MightSleep || cs == SleepStatus::Sleeps) {
+              DE.Report(AutoDtor->getVarDecl()->getLocation(),
+                        DiagNoSleepContextCall)
+                  << sleepStatusStr(cs) << Dtor->getNameAsString();
+            }
+          }
+        }
+        continue;
+      }
+
+      // --- CFGCleanupFunction: __attribute__((cleanup)) at scope exit ---
+      if (std::optional<CFGCleanupFunction> CF =
+              Elem.getAs<CFGCleanupFunction>()) {
+        const FunctionDecl *CleanupFn = CF->getFunctionDecl();
+        if (isNoSleepExit(CleanupFn)) {
+          if (Depth > 0)
+            Depth--;
+        } else if (isNoSleepEnter(CleanupFn)) {
+          Depth++;
+        } else if (Depth > 0) {
+          // Check if cleanup function might sleep in nosleep context
+          SleepStatus cs = resolveCallee(CleanupFn);
+          if (cs == SleepStatus::MightSleep || cs == SleepStatus::Sleeps) {
+            DE.Report(CF->getVarDecl()->getLocation(),
+                      DiagNoSleepContextCall)
+                << sleepStatusStr(cs) << CleanupFn->getNameAsString();
+          }
+        }
+        continue;
       }
     }
 
