@@ -20,6 +20,7 @@
 #include "clang/AST/ASTConsumer.h"
 #include "clang/AST/Attr.h"
 #include "clang/AST/RecursiveASTVisitor.h"
+#include "clang/Analysis/CFG.h"
 #include "clang/Basic/ParsedAttrInfo.h"
 #include "clang/Frontend/CompilerInstance.h"
 #include "clang/Frontend/FrontendPluginRegistry.h"
@@ -151,6 +152,56 @@ struct SleepsAttrInfo : public ParsedAttrInfo {
   }
 };
 
+struct NoSleepEnterAttrInfo : public ParsedAttrInfo {
+  static constexpr Spelling S[] = {
+      {AttributeCommonInfo::AS_GNU, "nosleep_enter"},
+      {AttributeCommonInfo::AS_CXX11, "nosleep_enter"},
+  };
+  NoSleepEnterAttrInfo() {
+    OptArgs = 0;
+    NumArgs = 0;
+    Spellings = S;
+  }
+  bool diagAppertainsToDecl(Sema &S, const ParsedAttr &Attr,
+                            const Decl *D) const override {
+    if (!isa<FunctionDecl>(D)) {
+      S.Diag(Attr.getLoc(), diag::warn_attribute_wrong_decl_type_str)
+          << Attr << Attr.isRegularKeywordAttribute() << "functions";
+      return false;
+    }
+    return true;
+  }
+  AttrHandling handleDeclAttribute(Sema &S, Decl *D,
+                                   const ParsedAttr &Attr) const override {
+    return applySleepAnnotation(S, D, Attr, "nosleep_enter");
+  }
+};
+
+struct NoSleepExitAttrInfo : public ParsedAttrInfo {
+  static constexpr Spelling S[] = {
+      {AttributeCommonInfo::AS_GNU, "nosleep_exit"},
+      {AttributeCommonInfo::AS_CXX11, "nosleep_exit"},
+  };
+  NoSleepExitAttrInfo() {
+    OptArgs = 0;
+    NumArgs = 0;
+    Spellings = S;
+  }
+  bool diagAppertainsToDecl(Sema &S, const ParsedAttr &Attr,
+                            const Decl *D) const override {
+    if (!isa<FunctionDecl>(D)) {
+      S.Diag(Attr.getLoc(), diag::warn_attribute_wrong_decl_type_str)
+          << Attr << Attr.isRegularKeywordAttribute() << "functions";
+      return false;
+    }
+    return true;
+  }
+  AttrHandling handleDeclAttribute(Sema &S, Decl *D,
+                                   const ParsedAttr &Attr) const override {
+    return applySleepAnnotation(S, D, Attr, "nosleep_exit");
+  }
+};
+
 } // anonymous namespace
 
 static ParsedAttrInfoRegistry::Add<NoSleepAttrInfo>
@@ -159,6 +210,10 @@ static ParsedAttrInfoRegistry::Add<MightSleepAttrInfo>
     XAttr2("might_sleep", "marks function as might_sleep");
 static ParsedAttrInfoRegistry::Add<SleepsAttrInfo>
     XAttr3("sleeps", "marks function as sleeps");
+static ParsedAttrInfoRegistry::Add<NoSleepEnterAttrInfo>
+    XAttr4("nosleep_enter", "marks function as nosleep_enter");
+static ParsedAttrInfoRegistry::Add<NoSleepExitAttrInfo>
+    XAttr5("nosleep_exit", "marks function as nosleep_exit");
 
 // ---------------------------------------------------------------------------
 // Helpers: read sleep annotation from a Decl
@@ -230,6 +285,24 @@ static bool isFuncPtrType(QualType QT) {
   return false;
 }
 
+// Check if a FunctionDecl has the nosleep_enter annotation
+static bool isNoSleepEnter(const FunctionDecl *FD) {
+  for (const auto *A : FD->specific_attrs<AnnotateAttr>()) {
+    if (A->getAnnotation() == "nosleep_enter")
+      return true;
+  }
+  return false;
+}
+
+// Check if a FunctionDecl has the nosleep_exit annotation
+static bool isNoSleepExit(const FunctionDecl *FD) {
+  for (const auto *A : FD->specific_attrs<AnnotateAttr>()) {
+    if (A->getAnnotation() == "nosleep_exit")
+      return true;
+  }
+  return false;
+}
+
 // ---------------------------------------------------------------------------
 // Information we collect per function
 // ---------------------------------------------------------------------------
@@ -254,8 +327,9 @@ class SleepCheckConsumer : public ASTConsumer {
   unsigned DiagSuggestNoSleep;
   unsigned DiagNoSleepCallsBad;
   unsigned DiagFPtrAssign;
-  unsigned DiagNoSleepBlockCall;
-  unsigned DiagNoSleepBlockFPtr;
+  unsigned DiagNoSleepContextCall;
+  unsigned DiagNoSleepContextFPtr;
+  unsigned DiagNoSleepHeldReturn;
   unsigned DiagGotoIntoNoSleep;
 
   std::map<const FunctionDecl *, FuncInfo> Funcs;
@@ -276,12 +350,15 @@ public:
     DiagFPtrAssign = DE.getCustomDiagID(
         DiagnosticsEngine::Error,
         "assigning '%0' function '%1' to 'nosleep' function pointer");
-    DiagNoSleepBlockCall = DE.getCustomDiagID(
+    DiagNoSleepContextCall = DE.getCustomDiagID(
         DiagnosticsEngine::Error,
-        "call to '%0' function '%1' inside 'nosleep' block");
-    DiagNoSleepBlockFPtr = DE.getCustomDiagID(
+        "call to '%0' function '%1' in nosleep context");
+    DiagNoSleepContextFPtr = DE.getCustomDiagID(
         DiagnosticsEngine::Error,
-        "call through '%0' function pointer inside 'nosleep' block");
+        "call through '%0' function pointer in nosleep context");
+    DiagNoSleepHeldReturn = DE.getCustomDiagID(
+        DiagnosticsEngine::Error,
+        "function '%0' may return with nosleep context held (depth %1)");
     DiagGotoIntoNoSleep = DE.getCustomDiagID(
         DiagnosticsEngine::Error,
         "goto jumps into 'nosleep' block from outside a 'nosleep' context");
@@ -295,12 +372,15 @@ private:
                         DiagnosticsEngine &DE);
   void checkVarInit(const VarDecl *VD, DiagnosticsEngine &DE);
   SleepStatus resolveCallee(const FunctionDecl *Callee);
+  void collectNoSleepInfo(const Stmt *S, unsigned Depth,
+                          std::set<const Stmt *> &NoSleepStmts,
+                          std::map<const LabelDecl *, unsigned> &LabelDepths,
+                          std::vector<std::pair<const GotoStmt *, unsigned>> &Gotos);
+  void analyzeNoSleepCFG(const FunctionDecl *FD, ASTContext &Ctx,
+                         DiagnosticsEngine &DE,
+                         const std::set<const Stmt *> &NoSleepStmts);
   void checkNoSleepBlocks(const FunctionDecl *FD, ASTContext &Ctx,
                           DiagnosticsEngine &DE);
-  void walkNoSleepBlocks(const Stmt *S, unsigned Depth, ASTContext &Ctx,
-                         DiagnosticsEngine &DE,
-                         std::map<const LabelDecl *, unsigned> &LabelDepths,
-                         std::vector<std::pair<const GotoStmt *, unsigned>> &Gotos);
 };
 
 // ---------------------------------------------------------------------------
@@ -353,6 +433,9 @@ SleepStatus SleepCheckConsumer::resolveCallee(const FunctionDecl *Callee) {
   if (it != Funcs.end())
     return it->second.Computed;
   if (Callee->getBuiltinID() != 0)
+    return SleepStatus::NoSleep;
+  // nosleep_enter/nosleep_exit don't sleep themselves
+  if (isNoSleepEnter(Callee) || isNoSleepExit(Callee))
     return SleepStatus::NoSleep;
   // Extern not in our map → might_sleep (rule 4)
   return SleepStatus::MightSleep;
@@ -451,10 +534,11 @@ static bool isNoSleepBlock(const AttributedStmt *AS) {
 }
 
 // ---------------------------------------------------------------------------
-// Walk function body checking calls inside nosleep blocks (rules 11, 12)
+// AST pre-pass: collect stmts inside nosleep blocks, label depths, and gotos
 // ---------------------------------------------------------------------------
-void SleepCheckConsumer::walkNoSleepBlocks(
-    const Stmt *S, unsigned Depth, ASTContext &Ctx, DiagnosticsEngine &DE,
+void SleepCheckConsumer::collectNoSleepInfo(
+    const Stmt *S, unsigned Depth,
+    std::set<const Stmt *> &NoSleepStmts,
     std::map<const LabelDecl *, unsigned> &LabelDepths,
     std::vector<std::pair<const GotoStmt *, unsigned>> &Gotos) {
   if (!S)
@@ -463,17 +547,22 @@ void SleepCheckConsumer::walkNoSleepBlocks(
   // Track nosleep block boundaries
   if (const auto *AS = dyn_cast<AttributedStmt>(S)) {
     if (isNoSleepBlock(AS)) {
-      walkNoSleepBlocks(AS->getSubStmt(), Depth + 1, Ctx, DE,
-                        LabelDepths, Gotos);
+      // Mark the sub-statement and everything inside as nosleep
+      collectNoSleepInfo(AS->getSubStmt(), Depth + 1, NoSleepStmts,
+                         LabelDepths, Gotos);
       return;
     }
   }
 
+  // If inside a nosleep block, mark this statement
+  if (Depth > 0)
+    NoSleepStmts.insert(S);
+
   // Record label depths for goto checking
   if (const auto *LS = dyn_cast<LabelStmt>(S)) {
     LabelDepths[LS->getDecl()] = Depth;
-    // Continue walking the sub-statement of the label
-    walkNoSleepBlocks(LS->getSubStmt(), Depth, Ctx, DE, LabelDepths, Gotos);
+    collectNoSleepInfo(LS->getSubStmt(), Depth, NoSleepStmts,
+                       LabelDepths, Gotos);
     return;
   }
 
@@ -482,40 +571,134 @@ void SleepCheckConsumer::walkNoSleepBlocks(
     Gotos.push_back({GS, Depth});
   }
 
-  // Check calls inside nosleep blocks (Depth > 0 means we're in one)
-  if (Depth > 0) {
-    if (const auto *CE = dyn_cast<CallExpr>(S)) {
-      if (const FunctionDecl *Callee = CE->getDirectCallee()) {
-        SleepStatus cs = resolveCallee(Callee->getCanonicalDecl());
-        if (cs == SleepStatus::MightSleep || cs == SleepStatus::Sleeps) {
-          DE.Report(CE->getBeginLoc(), DiagNoSleepBlockCall)
-              << sleepStatusStr(cs) << Callee->getNameAsString();
-        }
-      } else {
-        // Indirect call through function pointer
-        const Expr *CalleeExpr = CE->getCallee()->IgnoreParenImpCasts();
-        SleepStatus fpStatus = SleepStatus::Unknown;
+  for (const Stmt *Child : S->children())
+    collectNoSleepInfo(Child, Depth, NoSleepStmts, LabelDepths, Gotos);
+}
 
-        if (const auto *DRE = dyn_cast<DeclRefExpr>(CalleeExpr)) {
-          if (const auto *VD = dyn_cast<VarDecl>(DRE->getDecl()))
-            fpStatus = getVarAnnotation(VD);
-        } else if (const auto *ME = dyn_cast<MemberExpr>(CalleeExpr)) {
-          if (const auto *FD = dyn_cast<FieldDecl>(ME->getMemberDecl()))
-            fpStatus = getFieldAnnotation(FD);
-        }
+// ---------------------------------------------------------------------------
+// CFG dataflow analysis for nosleep context tracking
+// ---------------------------------------------------------------------------
+void SleepCheckConsumer::analyzeNoSleepCFG(
+    const FunctionDecl *FD, ASTContext &Ctx, DiagnosticsEngine &DE,
+    const std::set<const Stmt *> &NoSleepStmts) {
 
-        if (fpStatus != SleepStatus::NoSleep) {
-          const char *status = (fpStatus == SleepStatus::Unknown)
-                                   ? "might_sleep"
-                                   : sleepStatusStr(fpStatus);
-          DE.Report(CE->getBeginLoc(), DiagNoSleepBlockFPtr) << status;
+  // Build CFG
+  CFG::BuildOptions BO;
+  std::unique_ptr<CFG> cfg = CFG::buildCFG(FD, FD->getBody(), &Ctx, BO);
+  if (!cfg)
+    return;
+
+  unsigned NumBlocks = cfg->getNumBlockIDs();
+
+  // Entry depths per block (from enter/exit tracking only)
+  std::vector<unsigned> BlockEntryDepth(NumBlocks, 0);
+  std::vector<bool> BlockVisited(NumBlocks, false);
+  // Track which stmts we've already reported errors for
+  std::set<const Stmt *> Reported;
+
+  // Worklist-based forward dataflow
+  std::vector<const CFGBlock *> Worklist;
+  const CFGBlock &Entry = cfg->getEntry();
+  BlockVisited[Entry.getBlockID()] = true;
+  Worklist.push_back(&Entry);
+
+  while (!Worklist.empty()) {
+    const CFGBlock *Block = Worklist.back();
+    Worklist.pop_back();
+
+    unsigned Depth = BlockEntryDepth[Block->getBlockID()];
+
+    // Process each element in the block
+    for (const auto &Elem : *Block) {
+      std::optional<CFGStmt> CS = Elem.getAs<CFGStmt>();
+      if (!CS)
+        continue;
+
+      const Stmt *S = CS->getStmt();
+
+      if (const auto *CE = dyn_cast<CallExpr>(S)) {
+        if (const FunctionDecl *Callee = CE->getDirectCallee()) {
+          const FunctionDecl *CanonCallee = Callee->getCanonicalDecl();
+
+          // Check for nosleep_enter/exit
+          if (isNoSleepEnter(CanonCallee)) {
+            Depth++;
+            continue;
+          }
+          if (isNoSleepExit(CanonCallee)) {
+            if (Depth > 0)
+              Depth--;
+            continue;
+          }
+
+          // Check if calling a sleeping function in nosleep context
+          bool inNoSleep = (Depth > 0) ||
+                           (NoSleepStmts.count(S) > 0);
+          if (inNoSleep) {
+            SleepStatus cs = resolveCallee(CanonCallee);
+            if ((cs == SleepStatus::MightSleep || cs == SleepStatus::Sleeps) &&
+                Reported.insert(S).second) {
+              DE.Report(CE->getBeginLoc(), DiagNoSleepContextCall)
+                  << sleepStatusStr(cs) << Callee->getNameAsString();
+            }
+          }
+        } else {
+          // Indirect call through function pointer
+          bool inNoSleep = (Depth > 0) ||
+                           (NoSleepStmts.count(S) > 0);
+          if (inNoSleep) {
+            const Expr *CalleeExpr = CE->getCallee()->IgnoreParenImpCasts();
+            SleepStatus fpStatus = SleepStatus::Unknown;
+
+            if (const auto *DRE = dyn_cast<DeclRefExpr>(CalleeExpr)) {
+              if (const auto *VD = dyn_cast<VarDecl>(DRE->getDecl()))
+                fpStatus = getVarAnnotation(VD);
+            } else if (const auto *ME = dyn_cast<MemberExpr>(CalleeExpr)) {
+              if (const auto *FldD = dyn_cast<FieldDecl>(ME->getMemberDecl()))
+                fpStatus = getFieldAnnotation(FldD);
+            }
+
+            if (fpStatus != SleepStatus::NoSleep && Reported.insert(S).second) {
+              const char *status = (fpStatus == SleepStatus::Unknown)
+                                       ? "might_sleep"
+                                       : sleepStatusStr(fpStatus);
+              DE.Report(CE->getBeginLoc(), DiagNoSleepContextFPtr) << status;
+            }
+          }
         }
       }
     }
-  }
 
-  for (const Stmt *Child : S->children())
-    walkNoSleepBlocks(Child, Depth, Ctx, DE, LabelDepths, Gotos);
+    // Propagate exit depth to successors
+    for (const auto &Succ : Block->succs()) {
+      if (!Succ)
+        continue;
+      const CFGBlock *SuccBlock = Succ;
+      unsigned SuccID = SuccBlock->getBlockID();
+
+      if (!BlockVisited[SuccID]) {
+        BlockVisited[SuccID] = true;
+        BlockEntryDepth[SuccID] = Depth;
+        Worklist.push_back(SuccBlock);
+      } else if (Depth > BlockEntryDepth[SuccID]) {
+        // Conservative merge: use max
+        BlockEntryDepth[SuccID] = Depth;
+        Worklist.push_back(SuccBlock);
+      }
+    }
+
+    // Check for return with nosleep context held
+    // A block reaching the exit block with depth > 0 is an error
+    for (const auto &Succ : Block->succs()) {
+      if (!Succ)
+        continue;
+      if (Succ == &cfg->getExit() && Depth > 0) {
+        DE.Report(FD->getLocation(), DiagNoSleepHeldReturn)
+            << FD->getNameAsString() << Depth;
+        break;
+      }
+    }
+  }
 }
 
 void SleepCheckConsumer::checkNoSleepBlocks(const FunctionDecl *FD,
@@ -528,17 +711,22 @@ void SleepCheckConsumer::checkNoSleepBlocks(const FunctionDecl *FD,
   if (it != Funcs.end() && it->second.ExplicitTag == SleepStatus::NoSleep)
     return;
 
+  // Part A: AST pre-pass
+  std::set<const Stmt *> NoSleepStmts;
   std::map<const LabelDecl *, unsigned> LabelDepths;
   std::vector<std::pair<const GotoStmt *, unsigned>> Gotos;
 
-  walkNoSleepBlocks(FD->getBody(), 0, Ctx, DE, LabelDepths, Gotos);
+  collectNoSleepInfo(FD->getBody(), 0, NoSleepStmts, LabelDepths, Gotos);
 
-  // Rule 12: check gotos — error if jumping into nosleep from outside
+  // Part B: CFG dataflow analysis
+  analyzeNoSleepCFG(FD, Ctx, DE, NoSleepStmts);
+
+  // Part C: Goto check (rule 12) — error if jumping into nosleep from outside
   for (auto &[GS, GotoDepth] : Gotos) {
     const LabelDecl *Target = GS->getLabel();
     auto lit = LabelDepths.find(Target);
     if (lit == LabelDepths.end())
-      continue; // label not found (shouldn't happen in valid code)
+      continue;
     unsigned LabelDep = lit->second;
     if (LabelDep > 0 && GotoDepth == 0) {
       DE.Report(GS->getGotoLoc(), DiagGotoIntoNoSleep);

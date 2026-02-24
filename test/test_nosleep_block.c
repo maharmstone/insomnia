@@ -11,7 +11,7 @@ __attribute__((might_sleep)) void test_block_calls_might_sleep(void) {
     __attribute__((nosleep)) {
         safe_func(); // fine, nosleep callee
 
-        // EXPECTED-ERROR: call to 'might_sleep' function 'maybe_func' inside 'nosleep' block
+        // EXPECTED-ERROR: call to 'might_sleep' function 'maybe_func' in nosleep context
         maybe_func();
     }
 
@@ -21,7 +21,7 @@ __attribute__((might_sleep)) void test_block_calls_might_sleep(void) {
 // Calling sleeps inside a nosleep block is an error
 __attribute__((might_sleep)) void test_block_calls_sleeps(void) {
     __attribute__((nosleep)) {
-        // EXPECTED-ERROR: call to 'sleeps' function 'sleepy_func' inside 'nosleep' block
+        // EXPECTED-ERROR: call to 'sleeps' function 'sleepy_func' in nosleep context
         sleepy_func();
     }
 }
@@ -37,7 +37,7 @@ __attribute__((might_sleep)) void test_block_calls_safe(void) {
 typedef void (*generic_fp)(void);
 __attribute__((might_sleep)) void test_block_fptr(generic_fp fp) {
     __attribute__((nosleep)) {
-        // EXPECTED-ERROR: call through 'might_sleep' function pointer inside 'nosleep' block
+        // EXPECTED-ERROR: call through 'might_sleep' function pointer in nosleep context
         fp();
     }
 }

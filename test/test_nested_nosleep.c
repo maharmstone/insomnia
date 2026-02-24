@@ -11,11 +11,11 @@ __attribute__((might_sleep)) void test_nested_blocks(void) {
         __attribute__((nosleep)) {
             safe_func(); // fine, nested is ok
 
-            // EXPECTED-ERROR: call to 'might_sleep' function 'maybe_func' inside 'nosleep' block
+            // EXPECTED-ERROR: call to 'might_sleep' function 'maybe_func' in nosleep context
             maybe_func();
         }
 
-        // EXPECTED-ERROR: call to 'might_sleep' function 'maybe_func' inside 'nosleep' block
+        // EXPECTED-ERROR: call to 'might_sleep' function 'maybe_func' in nosleep context
         maybe_func(); // still in outer nosleep block
     }
 }
