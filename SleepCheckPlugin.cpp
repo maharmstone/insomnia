@@ -152,6 +152,33 @@ struct SleepsAttrInfo : public ParsedAttrInfo {
   }
 };
 
+struct ForceNoSleepAttrInfo : public ParsedAttrInfo {
+  static constexpr Spelling S[] = {
+      {AttributeCommonInfo::AS_GNU, "force_nosleep"},
+      {AttributeCommonInfo::AS_CXX11, "force_nosleep"},
+  };
+  ForceNoSleepAttrInfo() {
+    OptArgs = 0;
+    NumArgs = 0;
+    Spellings = S;
+  }
+  bool diagAppertainsToDecl(Sema &S, const ParsedAttr &Attr,
+                            const Decl *D) const override {
+    if (!isa<FunctionDecl>(D) && !isa<VarDecl>(D) && !isa<TypedefNameDecl>(D) &&
+        !isa<FieldDecl>(D)) {
+      S.Diag(Attr.getLoc(), diag::warn_attribute_wrong_decl_type_str)
+          << Attr << Attr.isRegularKeywordAttribute()
+          << "functions, variables, typedefs, or fields";
+      return false;
+    }
+    return true;
+  }
+  AttrHandling handleDeclAttribute(Sema &S, Decl *D,
+                                   const ParsedAttr &Attr) const override {
+    return applySleepAnnotation(S, D, Attr, "force_nosleep");
+  }
+};
+
 struct NoSleepEnterAttrInfo : public ParsedAttrInfo {
   static constexpr Spelling S[] = {
       {AttributeCommonInfo::AS_GNU, "nosleep_enter"},
@@ -210,10 +237,12 @@ static ParsedAttrInfoRegistry::Add<MightSleepAttrInfo>
     XAttr2("might_sleep", "marks function as might_sleep");
 static ParsedAttrInfoRegistry::Add<SleepsAttrInfo>
     XAttr3("sleeps", "marks function as sleeps");
+static ParsedAttrInfoRegistry::Add<ForceNoSleepAttrInfo>
+    XAttr4("force_nosleep", "marks function as nosleep without body checking");
 static ParsedAttrInfoRegistry::Add<NoSleepEnterAttrInfo>
-    XAttr4("nosleep_enter", "marks function as nosleep_enter");
+    XAttr5("nosleep_enter", "marks function as nosleep_enter");
 static ParsedAttrInfoRegistry::Add<NoSleepExitAttrInfo>
-    XAttr5("nosleep_exit", "marks function as nosleep_exit");
+    XAttr6("nosleep_exit", "marks function as nosleep_exit");
 
 // ---------------------------------------------------------------------------
 // Helpers: read sleep annotation from a Decl
@@ -224,7 +253,7 @@ static SleepStatus getOwnAnnotation(const Decl *D) {
     if (A->isInherited())
       continue;
     StringRef v = A->getAnnotation();
-    if (v == "nosleep")     return SleepStatus::NoSleep;
+    if (v == "nosleep" || v == "force_nosleep") return SleepStatus::NoSleep;
     if (v == "might_sleep") return SleepStatus::MightSleep;
     if (v == "sleeps")      return SleepStatus::Sleeps;
   }
@@ -235,7 +264,7 @@ static SleepStatus getOwnAnnotation(const Decl *D) {
 static SleepStatus getExplicitAnnotation(const Decl *D) {
   for (const auto *A : D->specific_attrs<AnnotateAttr>()) {
     StringRef v = A->getAnnotation();
-    if (v == "nosleep")     return SleepStatus::NoSleep;
+    if (v == "nosleep" || v == "force_nosleep") return SleepStatus::NoSleep;
     if (v == "might_sleep") return SleepStatus::MightSleep;
     if (v == "sleeps")      return SleepStatus::Sleeps;
   }
@@ -298,6 +327,15 @@ static bool isNoSleepEnter(const FunctionDecl *FD) {
 static bool isNoSleepExit(const FunctionDecl *FD) {
   for (const auto *A : FD->specific_attrs<AnnotateAttr>()) {
     if (A->getAnnotation() == "nosleep_exit")
+      return true;
+  }
+  return false;
+}
+
+// Check if a Decl has the force_nosleep annotation (nosleep without body checking)
+static bool isForceNoSleep(const Decl *D) {
+  for (const auto *A : D->specific_attrs<AnnotateAttr>()) {
+    if (A->getAnnotation() == "force_nosleep")
       return true;
   }
   return false;
@@ -937,7 +975,9 @@ void SleepCheckConsumer::HandleTranslationUnit(ASTContext &Ctx) {
     }
 
     // Rule 7: explicitly nosleep function calling might_sleep/sleeps
-    if (FI.ExplicitTag == SleepStatus::NoSleep) {
+    // Skip body checking for force_nosleep — it's a deliberate override.
+    if (FI.ExplicitTag == SleepStatus::NoSleep &&
+        !isForceNoSleep(Canon) && !isForceNoSleep(FI.Def)) {
       for (const auto *Callee : FI.Callees) {
         SleepStatus cs = resolveCallee(Callee);
         if (cs == SleepStatus::MightSleep || cs == SleepStatus::Sleeps) {
