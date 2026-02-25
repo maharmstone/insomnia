@@ -975,6 +975,13 @@ class SleepCheckAction : public PluginASTAction {
 public:
   std::unique_ptr<ASTConsumer>
   CreateASTConsumer(CompilerInstance &CI, llvm::StringRef) override {
+    // Define __SLEEP_CHECK__ before parsing begins, so user code can
+    // conditionally expand macros like NO_SLEEP to the real attribute.
+    auto &PP = CI.getPreprocessor();
+    std::string Predefines = PP.getPredefines();
+    Predefines += "#define __SLEEP_CHECK__ 1\n";
+    PP.setPredefines(Predefines);
+
     return std::make_unique<SleepCheckConsumer>(CI);
   }
 
